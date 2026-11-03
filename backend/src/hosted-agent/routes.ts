@@ -135,6 +135,11 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
   // Registered even when disabled, like Haystack: the provider itself emits nothing without `AGENT_ENABLED`.
   registerAgentProvider(createHostedAgentProvider())
   if (!settings.agentEnabled) {
+    // A mistaken operator opt-in must fail loudly instead of silently exposing
+    // a deployment without the promised attestation endpoint.
+    if (settings.agentAttestationEnabled) {
+      throw new Error('AGENT_ATTESTATION_ENABLED requires AGENT_ENABLED')
+    }
     return new Elysia({ name: 'hosted-agent-routes' })
   }
   if (!settings.agentModel) {
@@ -384,6 +389,19 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
           ctx.set.status = 400
           return createErrorResponse(getSafeErrorMessage(400))
         }
+        // A verified operator must target the exact boot instance just attested.
+        // Reject a mismatched or missing boot ID before admission, tools or model calls.
+        // Unauthenticated operator hints never alter ordinary user chat.
+        const attestationAuthorized = attestor?.authorized(ctx.request.headers.get('x-agent-attestation-token')) ?? false
+        if (
+          attestationAuthorized &&
+          ctx.request.headers.get('x-agent-attestation-expected-boot-id') !== attestor?.bootId
+        ) {
+          return Response.json(
+            { error: { code: 'AGENT_ATTESTATION_BOOT_MISMATCH' } },
+            { status: 409, headers: { 'cache-control': 'no-store' } },
+          )
+        }
         const messages = await convertToModelMessages(chatRequest.value.messages)
         const userId = ctx.user.id
         const admission = await admitManagedRequest({
@@ -417,7 +435,7 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
             messages,
             instructions: chatRequest.value.instructions,
             appLanguage: ctx.request.headers.get('X-App-Language'),
-            attestationAuthorized: attestor?.authorized(ctx.request.headers.get('x-agent-attestation-token')) ?? false,
+            attestationAuthorized,
             signal: ctx.request.signal,
             responseHeaders: ctx.set.headers,
             loaded,

@@ -332,7 +332,10 @@ describe('createHostedAgentRoutes', () => {
     it('binds an authorized chat response to the preflight signer boot', async () => {
       const app = createMockedApp({ settings: setup })
       const preflight = (await (await getIdentity(app)).json()) as { payload: { boot_id: string } }
-      const chat = await postChat(app, chatBody(), { 'x-agent-attestation-token': operatorToken })
+      const chat = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': preflight.payload.boot_id,
+      })
       expect(chat.status).toBe(200)
       expect(chat.headers.get('x-agent-attestation-boot-id')).toBe(preflight.payload.boot_id)
       await chat.text()
@@ -343,7 +346,45 @@ describe('createHostedAgentRoutes', () => {
       await withoutToken.text()
     })
 
+    it('rejects a missing or different operator boot ID before admission or inference', async () => {
+      const app = createMockedApp({ settings: setup })
+      const preflight = (await (await getIdentity(app)).json()) as { payload: { boot_id: string } }
+      const wrong = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': '00000000-0000-4000-8000-000000000000',
+      })
+      expect(wrong.status).toBe(409)
+      expect(wrong.headers.get('cache-control')).toBe('no-store')
+      expect(await wrong.json()).toEqual({ error: { code: 'AGENT_ATTESTATION_BOOT_MISMATCH' } })
+      const absent = await postChat(app, chatBody(), { 'x-agent-attestation-token': operatorToken })
+      expect(absent.status).toBe(409)
+      expect(model.doStreamCalls).toHaveLength(0)
+      const good = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': preflight.payload.boot_id,
+      })
+      expect(good.status).toBe(200)
+      await good.text()
+    })
+
+    it('rejects an operator chat routed to another replica before any model call', async () => {
+      const firstReplica = createMockedApp({ settings: setup })
+      const secondReplica = createMockedApp({ settings: setup })
+      const first = (await (await getIdentity(firstReplica)).json()) as { payload: { boot_id: string } }
+      const second = (await (await getIdentity(secondReplica)).json()) as { payload: { boot_id: string } }
+      expect(first.payload.boot_id).not.toBe(second.payload.boot_id)
+      const response = await postChat(secondReplica, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': first.payload.boot_id,
+      })
+      expect(response.status).toBe(409)
+      expect(model.doStreamCalls).toHaveLength(0)
+    })
+
     it('rejects misconfiguration at boot rather than issuing unreliable signatures', () => {
+      expect(() => createMockedApp({ settings: { ...setup, agentEnabled: false } })).toThrow(
+        'AGENT_ATTESTATION_ENABLED requires AGENT_ENABLED',
+      )
       expect(() => createMockedApp({ settings: { ...setup, agentMaxSteps: 2 } })).toThrow()
       expect(() => createMockedApp({ settings: { ...setup, agentMcpServers: '[{}]' } })).toThrow()
       expect(() => createMockedApp({ settings: { ...setup, agentAttestationOperatorToken: 'weak' } })).toThrow()
