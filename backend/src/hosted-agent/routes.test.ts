@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import type { Auth } from '@/auth/elysia-plugin'
+import { createHash, generateKeyPairSync, verify } from 'node:crypto'
 import type { Settings } from '@/config/settings'
 import { user } from '@/db/auth-schema'
 import { inferencePrices, inferenceUsage } from '@/db/inference-usage-schema'
@@ -25,6 +26,7 @@ import { MockLanguageModelV3 } from 'ai/test'
 import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime } from 'bun:test'
 import { eq, sql } from 'drizzle-orm'
 import { Elysia } from 'elysia'
+import { canonicalRuntimeAttestation } from './attestation'
 import { maxAgentInstructionsLength } from './history'
 import type { AgentMcpClients, AgentMcpToolsResult } from './mcp'
 import {
@@ -253,6 +255,141 @@ describe('createHostedAgentRoutes', () => {
     expect((await postChat(app)).status).toBe(404)
   })
 
+  describe('opt-in runtime attestation (no provider call)', () => {
+    const keys = generateKeyPairSync('ed25519')
+    const operatorToken = 'operator-test-token'.padEnd(48, 'z')
+    const setup = {
+      agentAttestationEnabled: true,
+      agentAttestationPrivateKeyBase64: Buffer.from(keys.privateKey.export({ type: 'pkcs8', format: 'pem' })).toString(
+        'base64',
+      ),
+      agentAttestationOperatorToken: operatorToken,
+      agentAttestationDeploymentId: 'test-deployment',
+      agentAttestationBackendCommit: 'eaa76696a42ef455dcf82ab76106b4a64550073f',
+      agentAttestationOrigin: 'https://agent.example.invalid',
+      agentMaxSteps: 1,
+      agentMcpServers: '',
+    }
+    const nonce = 'a'.repeat(32)
+    const getIdentity = (app: Elysia, challenge = nonce, token: string | null = operatorToken) =>
+      app.handle(
+        new Request(`http://localhost/agent/identity?nonce=${challenge}`, {
+          headers: token ? { 'x-agent-attestation-token': token } : {},
+        }),
+      )
+
+    it('is absent unless explicitly enabled; chat stays unchanged', async () => {
+      const app = createMockedApp()
+      expect((await getIdentity(app)).status).toBe(404)
+      const chat = await postChat(app, chatBody(), { 'x-agent-attestation-token': operatorToken })
+      expect(chat.status).toBe(200)
+      expect(chat.headers.get('x-agent-attestation-boot-id')).toBeNull()
+      await chat.text()
+    })
+
+    it('requires an authenticated user and a distinct operator token', async () => {
+      const app = createMockedApp({ settings: setup })
+      expect((await getIdentity(app, nonce, null)).status).toBe(403)
+      expect((await getIdentity(app, nonce, 'wrong-token')).status).toBe(403)
+      const forbidden = await getIdentity(app, nonce, 'wrong-token')
+      expect(JSON.stringify(await forbidden.json())).not.toContain('prompt_sha256')
+      const unauthenticated = createMockedApp({ settings: setup, auth: mockAuthUnauthenticated })
+      expect((await getIdentity(unauthenticated)).status).toBe(401)
+    })
+
+    it('requires a fresh well-formed operator-supplied challenge', async () => {
+      const app = createMockedApp({ settings: setup })
+      expect((await getIdentity(app, 'invalid')).status).toBe(400)
+      expect((await getIdentity(app, 'A'.repeat(32))).status).toBe(400)
+      expect((await getIdentity(app, 'b'.repeat(32))).status).toBe(200)
+    })
+
+    it('signs the in-process prompt digest, never the prompt text or secrets', async () => {
+      const app = createMockedApp({ settings: setup })
+      const res = await getIdentity(app)
+      expect(res.status).toBe(200)
+      expect(res.headers.get('cache-control')).toBe('no-store')
+      const body = (await res.json()) as {
+        payload: { prompt_sha256: string; boot_id: string; issued_at_ms: number; expires_at_ms: number }
+        signature: string
+      }
+      const expectedPrompt = 'You are the deployment agent.'
+      expect(body.payload.prompt_sha256).toBe(createHash('sha256').update(expectedPrompt, 'utf8').digest('hex'))
+      expect(body.payload.expires_at_ms - body.payload.issued_at_ms).toBe(15_000)
+      expect(
+        verify(
+          null,
+          Buffer.from(canonicalRuntimeAttestation(body.payload as never)),
+          keys.publicKey,
+          Buffer.from(body.signature, 'base64url'),
+        ),
+      ).toBe(true)
+      expect(JSON.stringify(body)).not.toContain(expectedPrompt)
+      expect(JSON.stringify(body)).not.toContain(operatorToken)
+      expect(model.doStreamCalls).toHaveLength(0)
+    })
+
+    it('binds an authorized chat response to the preflight signer boot', async () => {
+      const app = createMockedApp({ settings: setup })
+      const preflight = (await (await getIdentity(app)).json()) as { payload: { boot_id: string } }
+      const chat = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': preflight.payload.boot_id,
+      })
+      expect(chat.status).toBe(200)
+      expect(chat.headers.get('x-agent-attestation-boot-id')).toBe(preflight.payload.boot_id)
+      await chat.text()
+      await settleRun()
+      const withoutToken = await postChat(app)
+      expect(withoutToken.status).toBe(200)
+      expect(withoutToken.headers.get('x-agent-attestation-boot-id')).toBeNull()
+      await withoutToken.text()
+    })
+
+    it('rejects a missing or different operator boot ID before admission or inference', async () => {
+      const app = createMockedApp({ settings: setup })
+      const preflight = (await (await getIdentity(app)).json()) as { payload: { boot_id: string } }
+      const wrong = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': '00000000-0000-4000-8000-000000000000',
+      })
+      expect(wrong.status).toBe(409)
+      expect(wrong.headers.get('cache-control')).toBe('no-store')
+      expect(await wrong.json()).toEqual({ error: { code: 'AGENT_ATTESTATION_BOOT_MISMATCH' } })
+      const absent = await postChat(app, chatBody(), { 'x-agent-attestation-token': operatorToken })
+      expect(absent.status).toBe(409)
+      expect(model.doStreamCalls).toHaveLength(0)
+      const good = await postChat(app, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': preflight.payload.boot_id,
+      })
+      expect(good.status).toBe(200)
+      await good.text()
+    })
+
+    it('rejects an operator chat routed to another replica before any model call', async () => {
+      const firstReplica = createMockedApp({ settings: setup })
+      const secondReplica = createMockedApp({ settings: setup })
+      const first = (await (await getIdentity(firstReplica)).json()) as { payload: { boot_id: string } }
+      const second = (await (await getIdentity(secondReplica)).json()) as { payload: { boot_id: string } }
+      expect(first.payload.boot_id).not.toBe(second.payload.boot_id)
+      const response = await postChat(secondReplica, chatBody(), {
+        'x-agent-attestation-token': operatorToken,
+        'x-agent-attestation-expected-boot-id': first.payload.boot_id,
+      })
+      expect(response.status).toBe(409)
+      expect(model.doStreamCalls).toHaveLength(0)
+    })
+
+    it('rejects misconfiguration at boot rather than issuing unreliable signatures', () => {
+      expect(() => createMockedApp({ settings: { ...setup, agentEnabled: false } })).toThrow(
+        'AGENT_ATTESTATION_ENABLED requires AGENT_ENABLED',
+      )
+      expect(() => createMockedApp({ settings: { ...setup, agentMaxSteps: 2 } })).toThrow()
+      expect(() => createMockedApp({ settings: { ...setup, agentMcpServers: '[{}]' } })).toThrow()
+      expect(() => createMockedApp({ settings: { ...setup, agentAttestationOperatorToken: 'weak' } })).toThrow()
+    })
+  })
   it.each([true, false])('registers its discovery provider when AGENT_ENABLED is %p', (agentEnabled) => {
     resetAgentProvidersForTesting()
     createMockedApp({ settings: { agentEnabled } })

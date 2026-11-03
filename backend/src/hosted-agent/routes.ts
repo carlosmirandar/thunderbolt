@@ -42,6 +42,7 @@ import {
 import { Elysia, type AnyElysia } from 'elysia'
 import type { Logger } from 'pino'
 import { parseAgentChatRequest } from './history'
+import { createAgentRuntimeAttestor } from './attestation'
 import { createAgentMcpClients, parseAgentMcpServers, type AgentMcpClients, type AgentMcpToolsResult } from './mcp'
 import { createAgentModel, getAgentIdentity, getAgentRequestHeaders } from './model'
 import { assertServiceTierPriced, priceForServiceTier } from './pricing'
@@ -98,6 +99,8 @@ type AgentRunRequest = {
   instructions?: string
   /** Raw `X-App-Language` header value, or null when absent. */
   appLanguage: string | null
+  /** Operator token validated for this request; never recorded or returned. */
+  attestationAuthorized: boolean
   /** The request's own, which aborts when the visitor leaves. */
   signal: AbortSignal
   /** Headers the route has set, sent with the stream. */
@@ -132,12 +135,20 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
   // Registered even when disabled, like Haystack: the provider itself emits nothing without `AGENT_ENABLED`.
   registerAgentProvider(createHostedAgentProvider())
   if (!settings.agentEnabled) {
+    // A mistaken operator opt-in must fail loudly instead of silently exposing
+    // a deployment without the promised attestation endpoint.
+    if (settings.agentAttestationEnabled) {
+      throw new Error('AGENT_ATTESTATION_ENABLED requires AGENT_ENABLED')
+    }
     return new Elysia({ name: 'hosted-agent-routes' })
   }
   if (!settings.agentModel) {
     throw new Error('AGENT_MODEL is required when AGENT_ENABLED is true')
   }
 
+  // Built in the SAME route factory that serves /chat: a separate signing service
+  // cannot attest the live prompt. Disabled by default; invalid config fails startup.
+  const attestor = createAgentRuntimeAttestor(settings)
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? agentUpstreamTimeoutMs
   const identity = getAgentIdentity(settings.agentModel)
   assertServiceTierPriced(identity, settings)
@@ -161,6 +172,7 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
     messages,
     instructions,
     appLanguage,
+    attestationAuthorized,
     signal,
     responseHeaders,
     loaded: { tools, toolDefinitions, unavailableServers, isCallBudgetSpent },
@@ -327,12 +339,17 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
       sendReasoning: false,
       messageMetadata: createToolTimingMetadata(),
     })
+    // An operator who passed the attestation token can bind THIS chat response
+    // to the boot ID signed in the preflight challenge. Not a public header.
+    if (attestor && attestationAuthorized) {
+      response.headers.set('x-agent-attestation-boot-id', attestor.bootId)
+    }
     // Last, so the run takes the slot over only once nothing here can throw.
     void runToCompletion()
     return response
   }
 
-  return new Elysia({ name: 'hosted-agent-routes', prefix: '/agent' })
+  const routes = new Elysia({ name: 'hosted-agent-routes', prefix: '/agent' })
     .onError(safeErrorHandler)
     .use(
       createMeteredRouteGuard({
@@ -372,6 +389,20 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
           ctx.set.status = 400
           return createErrorResponse(getSafeErrorMessage(400))
         }
+        // A verified operator must target the exact boot instance just attested.
+        // Reject a mismatched or missing boot ID before admission, tools or model calls.
+        // Unauthenticated operator hints never alter ordinary user chat.
+        const attestationAuthorized =
+          attestor?.authorized(ctx.request.headers.get('x-agent-attestation-token')) ?? false
+        if (
+          attestationAuthorized &&
+          ctx.request.headers.get('x-agent-attestation-expected-boot-id') !== attestor?.bootId
+        ) {
+          return Response.json(
+            { error: { code: 'AGENT_ATTESTATION_BOOT_MISMATCH' } },
+            { status: 409, headers: { 'cache-control': 'no-store' } },
+          )
+        }
         const messages = await convertToModelMessages(chatRequest.value.messages)
         const userId = ctx.user.id
         const admission = await admitManagedRequest({
@@ -405,6 +436,7 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
             messages,
             instructions: chatRequest.value.instructions,
             appLanguage: ctx.request.headers.get('X-App-Language'),
+            attestationAuthorized,
             signal: ctx.request.signal,
             responseHeaders: ctx.set.headers,
             loaded,
@@ -417,4 +449,23 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
       // The handler reads the raw stream itself under a byte cap.
       { parse: 'none' },
     )
+
+  // This is scoped behind the same authenticated route guard as /chat, PLUS
+  // a separate high-entropy operator token. No provider call or metered inference.
+  // When disabled, the identity endpoint is not mounted at all (404).
+  if (attestor) {
+    routes.get('/identity', ({ request }) => {
+      const headers = { 'cache-control': 'no-store' }
+      if (!attestor.authorized(request.headers.get('x-agent-attestation-token'))) {
+        return Response.json({ error: { code: 'AGENT_ATTESTATION_FORBIDDEN' } }, { status: 403, headers })
+      }
+      const nonce = new URL(request.url).searchParams.get('nonce') ?? ''
+      const signed = attestor.signChallenge(nonce)
+      if (!signed) {
+        return Response.json({ error: { code: 'AGENT_ATTESTATION_INVALID_NONCE' } }, { status: 400, headers })
+      }
+      return Response.json(signed, { headers })
+    })
+  }
+  return routes
 }

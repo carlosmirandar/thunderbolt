@@ -307,6 +307,14 @@ const settingsSchema = z
     // Fireworks serving tier for the hosted agent. `priority` is less likely to be load-shed and costs more.
     agentFireworksServiceTier: z.enum(['standard', 'priority']).default('standard'),
     agentSystemPrompt: z.string().default(''),
+    // Operator-only, signed runtime attestation. Disabled unless explicitly configured.
+    // Secrets are backend-only and must never be sent to the browser or exposed by discovery.
+    agentAttestationEnabled: z.boolean().default(false),
+    agentAttestationPrivateKeyBase64: z.string().default(''),
+    agentAttestationOperatorToken: z.string().default(''),
+    agentAttestationDeploymentId: z.string().default(''),
+    agentAttestationBackendCommit: z.string().default(''),
+    agentAttestationOrigin: z.string().default(''),
     // JSON array of MCP servers whose read-only tools the hosted agent may call, parsed by `parseAgentMcpServers`
     // (`@/hosted-agent/mcp`) when the agent mounts, so a malformed value fails the boot.
     agentMcpServers: z.string().default(''),
@@ -623,6 +631,12 @@ const parseSettings = (): Settings => {
     agentMaxSteps: process.env.AGENT_MAX_STEPS || undefined,
     agentFireworksServiceTier: process.env.AGENT_FIREWORKS_SERVICE_TIER || undefined,
     agentSystemPrompt: process.env.AGENT_SYSTEM_PROMPT || '',
+    agentAttestationEnabled: process.env.AGENT_ATTESTATION_ENABLED === 'true',
+    agentAttestationPrivateKeyBase64: process.env.AGENT_ATTESTATION_PRIVATE_KEY_PEM_BASE64 || '',
+    agentAttestationOperatorToken: process.env.AGENT_ATTESTATION_OPERATOR_TOKEN || '',
+    agentAttestationDeploymentId: process.env.AGENT_ATTESTATION_DEPLOYMENT_ID || '',
+    agentAttestationBackendCommit: process.env.AGENT_ATTESTATION_BACKEND_COMMIT || '',
+    agentAttestationOrigin: process.env.AGENT_ATTESTATION_ORIGIN || '',
     agentMcpServers: process.env.AGENT_MCP_SERVERS || '',
     agentName: process.env.AGENT_NAME || undefined,
     agentDescription: process.env.AGENT_DESCRIPTION || '',
