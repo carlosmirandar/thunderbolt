@@ -392,7 +392,8 @@ export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions)
         // A verified operator must target the exact boot instance just attested.
         // Reject a mismatched or missing boot ID before admission, tools or model calls.
         // Unauthenticated operator hints never alter ordinary user chat.
-        const attestationAuthorized = attestor?.authorized(ctx.request.headers.get('x-agent-attestation-token')) ?? false
+        const attestationAuthorized =
+          attestor?.authorized(ctx.request.headers.get('x-agent-attestation-token')) ?? false
         if (
           attestationAuthorized &&
           ctx.request.headers.get('x-agent-attestation-expected-boot-id') !== attestor?.bootId
