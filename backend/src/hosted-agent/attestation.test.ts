@@ -41,7 +41,14 @@ describe('attestation — disabled by default, no model, no network', () => {
     expect(JSON.stringify(proof)).not.toContain(settings().agentSystemPrompt)
     expect(JSON.stringify(proof)).not.toContain(token)
     expect(JSON.stringify(proof)).not.toContain(fakePrivateKeyBase64)
-    expect(verify(null, Buffer.from(canonicalRuntimeAttestation(proof.payload)), keys.publicKey, Buffer.from(proof.signature, 'base64url'))).toBe(true)
+    expect(
+      verify(
+        null,
+        Buffer.from(canonicalRuntimeAttestation(proof.payload)),
+        keys.publicKey,
+        Buffer.from(proof.signature, 'base64url'),
+      ),
+    ).toBe(true)
   })
   it('refuses invalid tokens and malformed challenges', () => {
     const signer = createAgentRuntimeAttestor(settings())!
@@ -57,8 +64,12 @@ describe('attestation — disabled by default, no model, no network', () => {
     expect(() => createAgentRuntimeAttestor(settings({ agentAttestationPrivateKeyBase64: '' }))).toThrow()
   })
   it('requires fixed HTTPS origin, deployment, commit and pilot configuration', () => {
-    expect(() => createAgentRuntimeAttestor(settings({ agentAttestationOrigin: 'http://agent.example.invalid' }))).toThrow()
-    expect(() => createAgentRuntimeAttestor(settings({ agentAttestationOrigin: 'https://agent.example.invalid/path' }))).toThrow()
+    expect(() =>
+      createAgentRuntimeAttestor(settings({ agentAttestationOrigin: 'http://agent.example.invalid' })),
+    ).toThrow()
+    expect(() =>
+      createAgentRuntimeAttestor(settings({ agentAttestationOrigin: 'https://agent.example.invalid/path' })),
+    ).toThrow()
     expect(() => createAgentRuntimeAttestor(settings({ agentAttestationDeploymentId: '' }))).toThrow()
     expect(() => createAgentRuntimeAttestor(settings({ agentAttestationBackendCommit: 'not-a-sha' }))).toThrow()
     expect(() => createAgentRuntimeAttestor(settings({ agentMaxSteps: 2 }))).toThrow()
@@ -74,5 +85,40 @@ describe('attestation — disabled by default, no model, no network', () => {
     const a = createAgentRuntimeAttestor(settings())!
     const b = createAgentRuntimeAttestor(settings({ agentSystemPrompt: 'Otro prompt' }))!
     expect(a.promptSha256).not.toBe(b.promptSha256)
+  })
+  it('rejects a non-Ed25519 or public-only key at boot', () => {
+    const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    const rsaPem = Buffer.from(rsa.privateKey.export({ type: 'pkcs8', format: 'pem' })).toString('base64')
+    expect(() => createAgentRuntimeAttestor(settings({ agentAttestationPrivateKeyBase64: rsaPem }))).toThrow()
+    const publicPem = Buffer.from(keys.publicKey.export({ type: 'spki', format: 'pem' })).toString('base64')
+    expect(() => createAgentRuntimeAttestor(settings({ agentAttestationPrivateKeyBase64: publicPem }))).toThrow()
+  })
+  it('a tampered payload no longer verifies', () => {
+    const signer = createAgentRuntimeAttestor(settings(), { now: () => fixedNow })!
+    const proof = signer.signChallenge('c'.repeat(32))!
+    const tampered = { ...proof.payload, prompt_sha256: '0'.repeat(64) }
+    const sig = Buffer.from(proof.signature, 'base64url')
+    expect(verify(null, Buffer.from(canonicalRuntimeAttestation(tampered)), keys.publicKey, sig)).toBe(false)
+  })
+  it('pins the canonical field order consumed by the external verifier', () => {
+    const signer = createAgentRuntimeAttestor(settings(), { now: () => fixedNow })!
+    const proof = signer.signChallenge('d'.repeat(32))!
+    expect(Object.keys(JSON.parse(canonicalRuntimeAttestation(proof.payload)))).toEqual([
+      'schema_version',
+      'nonce',
+      'audience',
+      'origin',
+      'issued_at_ms',
+      'expires_at_ms',
+      'backend_commit',
+      'deployment_id',
+      'boot_id',
+      'agent_id',
+      'agent_name',
+      'model',
+      'max_steps',
+      'mcp_servers',
+      'prompt_sha256',
+    ])
   })
 })

@@ -82,9 +82,14 @@ export const createAgentRuntimeAttestor = (
   settings: AttestationSettings,
   options: { now?: () => number; bootId?: string } = {},
 ): RuntimeAttestor | null => {
-  if (!settings.agentAttestationEnabled) return null
-  if (!settings.agentAttestationOperatorToken || settings.agentAttestationOperatorToken.length < 32 ||
-      settings.agentAttestationOperatorToken.length > 512) {
+  if (!settings.agentAttestationEnabled) {
+    return null
+  }
+  if (
+    !settings.agentAttestationOperatorToken ||
+    settings.agentAttestationOperatorToken.length < 32 ||
+    settings.agentAttestationOperatorToken.length > 512
+  ) {
     throw new Error('Agent attestation requires a strong operator token')
   }
   if (!commitPattern.test(settings.agentAttestationBackendCommit)) {
@@ -103,7 +108,12 @@ export const createAgentRuntimeAttestor = (
   if (settings.agentMaxSteps !== 1 || settings.agentMcpServers.trim() !== '') {
     throw new Error('Agent attestation pilot only supports one step and no MCP servers')
   }
-  if (!settings.agentName || settings.agentName.length > 128 || !settings.agentModel || settings.agentModel.length > 256) {
+  if (
+    !settings.agentName ||
+    settings.agentName.length > 128 ||
+    !settings.agentModel ||
+    settings.agentModel.length > 256
+  ) {
     throw new Error('Agent attestation requires a valid name and model')
   }
   let pem: string
@@ -127,14 +137,20 @@ export const createAgentRuntimeAttestor = (
     bootId,
     promptSha256,
     authorized: (operatorToken) => {
-      if (!operatorToken) return false
+      if (!operatorToken) {
+        return false
+      }
       const provided = Buffer.from(operatorToken, 'utf8')
       return provided.length === expectedToken.length && timingSafeEqual(expectedToken, provided)
     },
     signChallenge: (nonce) => {
-      if (!noncePattern.test(nonce)) return null
+      if (!noncePattern.test(nonce)) {
+        return null
+      }
       const issued = now()
-      if (!Number.isSafeInteger(issued) || issued < 0) return null
+      if (!Number.isSafeInteger(issued) || issued < 0) {
+        return null
+      }
       const payload: RuntimeAttestationPayload = {
         schema_version: 1,
         nonce,
@@ -152,7 +168,9 @@ export const createAgentRuntimeAttestor = (
         mcp_servers: 0,
         prompt_sha256: promptSha256,
       }
-      const signature = sign(null, Buffer.from(canonicalRuntimeAttestation(payload), 'utf8'), privateKey).toString('base64url')
+      const signature = sign(null, Buffer.from(canonicalRuntimeAttestation(payload), 'utf8'), privateKey).toString(
+        'base64url',
+      )
       return { payload, signature }
     },
   }
